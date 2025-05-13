@@ -7,27 +7,26 @@ const int yellowLEDPin = 10;  // LED jaune
 const int redLEDPin    = 11;  // LED rouge
 
 // ==== TEMPOS (ms) ====
-const unsigned long SLEEP_BLINK_INTERVAL = 30UL * 1000;     // 30 s
-const unsigned long SHOWER_TIMEOUT       = 5UL  * 60 * 1000; // 5 min
-const unsigned long ERROR_TIMEOUT        = 2UL  * 60 * 1000; // 2 min
-const unsigned long YELLOW_BLINK_INTERVAL= 1000;             // 1 s
+const unsigned long SLEEP_BLINK_INTERVAL  = 1000;
+const unsigned long SHOWER_TIMEOUT        = 60000;
+const unsigned long ERROR_TIMEOUT         = 60000;
+const unsigned long YELLOW_BLINK_INTERVAL = 1000;
 
 // ==== ÉTATS ====
 enum Mode { MODE_SLEEP, MODE_SHOWER };
-Mode currentMode = MODE_SLEEP;
-bool pumpState       = false;  // état du relais
-bool blinkOn         = false;  // pour clignotement sleep (LED verte)
-bool errorState      = false;  // alerte blocage
+Mode currentMode     = MODE_SHOWER;
+bool pumpState       = false;
+bool blinkOn         = false;
+bool errorState      = false;
+bool sleepDrainDone  = false;  // <--- nouveau flag
+bool yellowBlinkState= false;
+bool lastBState      = false;
 
 // ==== TIMERS ====
-unsigned long lastBlinkTime      = 0;  // sleep vert
-unsigned long lastActivityTime   = 0;  // timeout douche→sleep
-unsigned long highLevelStartTime = 0;  // début éventuelle erreur
-unsigned long lastYellowBlinkTime= 0;  // clignotement jaune
-bool yellowBlinkState            = false;
-
-// pour front montant B
-bool lastBState = false;
+unsigned long lastBlinkTime       = 0;
+unsigned long lastActivityTime    = 0;
+unsigned long highLevelStartTime  = 0;
+unsigned long lastYellowBlinkTime = 0;
 
 void setup() {
   pinMode(floatAPin,    INPUT_PULLUP);
@@ -37,138 +36,136 @@ void setup() {
   pinMode(yellowLEDPin, OUTPUT);
   pinMode(redLEDPin,    OUTPUT);
 
-  // tout éteint au démarrage
+  // Tout éteint au démarrage
   digitalWrite(relayPin,     LOW);
   digitalWrite(greenLEDPin,  LOW);
   digitalWrite(yellowLEDPin, LOW);
   digitalWrite(redLEDPin,    LOW);
 
-  lastBlinkTime       = millis();
-  lastActivityTime    = millis();
-  lastYellowBlinkTime = millis();
+  unsigned long now = millis();
+  lastBlinkTime       = now;
+  lastActivityTime    = now;
+  highLevelStartTime  = now;
+  lastYellowBlinkTime = now;
 }
 
 void loop() {
   unsigned long now = millis();
-  bool A_haut = digitalRead(floatAPin)  == HIGH;
-  bool B_haut = digitalRead(floatBPin)  == HIGH;
+  bool A_haut = digitalRead(floatAPin) == HIGH;
+  bool B_haut = digitalRead(floatBPin) == HIGH;
 
-  // front montant sur B → reset erreur en douche
+  // Front montant sur B → reset erreur en mode douche
   if (currentMode == MODE_SHOWER && B_haut && !lastBState) {
     highLevelStartTime = now;
     errorState         = false;
   }
   lastBState = B_haut;
 
+  // Dispatch selon le mode
   if (currentMode == MODE_SLEEP) {
-    // --- MODE VEILLE ---
-    // 1) Drainage si A haut & B bas
-    if (A_haut && !B_haut) {
-      if (!pumpState) {
-        pumpState = true;
-        digitalWrite(relayPin, HIGH);
-      }
-    } else if (pumpState) {
-      pumpState = false;
-      digitalWrite(relayPin, LOW);
-    }
+    handleSleepMode(now, A_haut);
+  } else {
+    handleShowerMode(now, A_haut, B_haut);
+  }
 
-    // 2) Clignotement LED verte
-    if (now - lastBlinkTime >= SLEEP_BLINK_INTERVAL) {
-      blinkOn = !blinkOn;
-      digitalWrite(greenLEDPin, blinkOn);
-      lastBlinkTime = now;
-    }
+  // Mise à jour des LED (calcul local de rising)
+  updateLEDs(now, A_haut, B_haut);
+}
 
-    // 3) LEDs autres éteintes
-    digitalWrite(yellowLEDPin, LOW);
-    digitalWrite(redLEDPin,    LOW);
-
-    // 4) Passage en mode douche si A+B hauts
-    if (A_haut && B_haut) {
-      currentMode      = MODE_SHOWER;
-      lastActivityTime = now;
-      // reset clignotement sleep
-      blinkOn = false;
-      digitalWrite(greenLEDPin, LOW);
+// ----- SLEEP MODE -----
+void handleSleepMode(unsigned long now, bool A_haut) {
+  if (!sleepDrainDone) {
+    // 1× seule vidange : tant que A est haut, on pompe
+    if (A_haut) {
+      setPump(true);
+    } else {
+      // dès qu'il n'y a plus d'eau sur A → on arrête la pompe pour de bon
+      setPump(false);
+      sleepDrainDone = true;
     }
   }
   else {
-    // --- MODE DOUCHE ---
-    // 1) Détection montée entre A et B (avant pompe)
-    bool rising = (A_haut && !B_haut && !pumpState);
-
-    // 2) Gestion pompe
-    if (!pumpState) {
-      if (A_haut && B_haut) {
-        pumpState = true;
-        digitalWrite(relayPin, HIGH);
-        lastActivityTime = now;
-        // démarrage lance clignotement jaune
-        lastYellowBlinkTime = now;
-        yellowBlinkState    = true;
-      }
-    } else {
-      if (!A_haut) {
-        pumpState = false;
-        digitalWrite(relayPin, LOW);
-        lastActivityTime = now;
-        // stop clignotement jaune
-        yellowBlinkState = false;
-        digitalWrite(yellowLEDPin, LOW);
-      }
-    }
-
-    // 3) Vérif. blocage
-    if (!errorState
-        && A_haut && B_haut
-        && !pumpState
-        && (now - highLevelStartTime >= ERROR_TIMEOUT)) {
-      errorState = true;
-    }
-
-    // 4) Affichage LEDs (priorité)
-    if (errorState) {
-      digitalWrite(redLEDPin,    HIGH);
-      digitalWrite(greenLEDPin,  LOW);
-      digitalWrite(yellowLEDPin, LOW);
-    }
-    else if (rising) {
-      // montée → jaune fixe
-      digitalWrite(yellowLEDPin, HIGH);
-      digitalWrite(greenLEDPin,  LOW);
-      digitalWrite(redLEDPin,    LOW);
-    }
-    else if (pumpState) {
-      // pompe ON → jaune clignote 1 Hz
-      if (now - lastYellowBlinkTime >= YELLOW_BLINK_INTERVAL) {
-        yellowBlinkState = !yellowBlinkState;
-        lastYellowBlinkTime = now;
-      }
-      digitalWrite(yellowLEDPin, yellowBlinkState);
-      digitalWrite(greenLEDPin,  LOW);
-      digitalWrite(redLEDPin,    LOW);
-    }
-    else {
-      // attente (A bas ou autre) → LED verte fixe
-      digitalWrite(greenLEDPin,  HIGH);
-      digitalWrite(yellowLEDPin, LOW);
-      digitalWrite(redLEDPin,    LOW);
-    }
-
-    // 5) Timeout retour veille
-    if (now - lastActivityTime >= SHOWER_TIMEOUT) {
-      // remise à zéro
-      currentMode = MODE_SLEEP;
-      pumpState   = false;
-      errorState  = false;
-      digitalWrite(relayPin,     LOW);
-      digitalWrite(greenLEDPin,  LOW);
-      digitalWrite(yellowLEDPin, LOW);
-      digitalWrite(redLEDPin,    LOW);
-      // réarmement blink sleep
-      lastBlinkTime = now;
-      blinkOn       = false;
+    // Vidange faite → pompe toujours arrêtée
+    setPump(false);
+    // Si A remonte, on repart direct en douche
+    if (A_haut) {
+      currentMode      = MODE_SHOWER;
+      lastActivityTime = now;
+      highLevelStartTime = now;
     }
   }
+
+  // Clignotement vert permanent en veille
+  if (now - lastBlinkTime >= SLEEP_BLINK_INTERVAL) {
+    blinkOn = !blinkOn;
+    lastBlinkTime = now;
+  }
+}
+
+// ----- SHOWER MODE -----
+void handleShowerMode(unsigned long now, bool A_haut, bool B_haut) {
+  bool rising = (A_haut && !B_haut && !pumpState);
+
+  // Démarrage / arrêt pompe
+  if (!pumpState && A_haut && B_haut) {
+    setPump(true);
+    lastActivityTime    = now;
+    yellowBlinkState    = true;
+    lastYellowBlinkTime = now;
+  }
+  else if (pumpState && !A_haut) {
+    setPump(false);
+    lastActivityTime = now;
+    yellowBlinkState = false;
+  }
+
+  // Erreur si eau bloquée trop longtemps
+  if (!errorState
+      && A_haut && B_haut
+      && !pumpState
+      && (now - highLevelStartTime >= ERROR_TIMEOUT)) {
+    errorState = true;
+  }
+
+  // Timeout douche → retour en veille
+  if (now - lastActivityTime >= SHOWER_TIMEOUT) {
+    currentMode     = MODE_SLEEP;
+    errorState      = false;
+    setPump(false);
+    sleepDrainDone  = false;    // on réarme la vidange pour la prochaine veille
+    blinkOn         = false;
+    lastBlinkTime   = now;
+  }
+}
+
+// ----- POMPE -----
+void setPump(bool on) {
+  pumpState = on;
+  digitalWrite(relayPin, on ? HIGH : LOW);
+}
+
+// ----- LEDs -----
+void updateLEDs(unsigned long now, bool A_haut, bool B_haut) {
+  // Recalcul de rising pour LED jaune fixe
+  bool rising = (A_haut && !B_haut && !pumpState);
+
+  // Clignotement jaune si la pompe tourne
+  if (pumpState && (now - lastYellowBlinkTime >= YELLOW_BLINK_INTERVAL)) {
+    yellowBlinkState    = !yellowBlinkState;
+    lastYellowBlinkTime = now;
+  }
+
+  // Vert : toujours allumé en douche, clignote en veille
+  bool green  = (currentMode == MODE_SHOWER)
+                || (currentMode == MODE_SLEEP && blinkOn);
+
+  // Jaune : montée ou pompe en clignote
+  bool yellow = rising || (pumpState && yellowBlinkState);
+
+  // Rouge : erreur
+  bool red    = errorState;
+
+  digitalWrite(greenLEDPin,  green  ? HIGH : LOW);
+  digitalWrite(yellowLEDPin, yellow ? HIGH : LOW);
+  digitalWrite(redLEDPin,    red    ? HIGH : LOW);
 }
